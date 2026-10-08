@@ -29,6 +29,7 @@ const APP_ID = Deno.env.get("META_APP_ID");
 const APP_SECRET = Deno.env.get("META_APP_SECRET");
 const DEFAULT_ACCESS_TOKEN = Deno.env.get("META_SYSTEM_USER_ACCESS_TOKEN") ||
   "";
+const BRIDGE_TOKEN = Deno.env.get("WHATSAPP_WEB_TOKEN") || "";
 
 /**
  * Queries the database for organization addresses and returns a map.
@@ -510,7 +511,393 @@ function extractEditedText(message: EditedMessage): string | undefined {
   }
 }
 
+/**
+ * Bridge (whatsmeow) webhook payload types.
+ * Mirrors open-bsp-whatsmeow's WebhookBatch (openbsp.go) — the connector
+ * webhook contract. Content is already in OpenBSP's MessageContent shape.
+ */
+interface BridgeFilePayload {
+  mime_type: string;
+  uri?: string;
+  name?: string;
+  size?: number;
+}
+
+interface BridgeMessageContent {
+  version: string;
+  type: string;
+  kind: string;
+  text?: string;
+  file?: BridgeFilePayload;
+  data?: unknown;
+  re_message_id?: string;
+  forwarded?: boolean;
+  mentions?: Array<{ address?: string; agent_id?: string; name?: string }>;
+}
+
+interface BridgeWebhookMessage {
+  external_id: string;
+  conversation_address: string;
+  sender_address?: string;
+  sender_name?: string;
+  conversation_name?: string;
+  content: BridgeMessageContent;
+  timestamp: string;
+}
+
+interface BridgeWebhookStatus {
+  external_id: string;
+  conversation_address: string;
+  status: Record<string, unknown>;
+}
+
+interface BridgeWebhookContact {
+  address: string;
+  extra?: Record<string, unknown>;
+}
+
+interface BridgeWebhookGroup {
+  address: string;
+  name?: string;
+  renamed?: boolean;
+  timestamp?: string;
+}
+
+interface BridgeWebhookEdit {
+  external_id?: string;
+  original_message_id: string;
+  conversation_address?: string;
+  sender_address?: string;
+  text: string;
+  timestamp: string;
+}
+
+interface BridgeWebhookRevoke {
+  external_id?: string;
+  original_message_id: string;
+  conversation_address?: string;
+  sender_address?: string;
+  timestamp: string;
+}
+
+interface BridgeWebhookBatch {
+  organization_address: string;
+  history?: boolean;
+  messages?: BridgeWebhookMessage[];
+  statuses?: BridgeWebhookStatus[];
+  contacts?: BridgeWebhookContact[];
+  groups?: BridgeWebhookGroup[];
+  edits?: BridgeWebhookEdit[];
+  revokes?: BridgeWebhookRevoke[];
+}
+
+/**
+ * Finds the organization for a bridge session address, creating the
+ * organization and its address row on first contact (pairing should have
+ * created it via whatsapp-web-management, but the bridge may deliver before
+ * that completes).
+ */
+async function ensureBridgeOrganization(
+  client: SupabaseClient<Database>,
+  organization_address: string,
+): Promise<OrganizationAddressRow> {
+  const { data: existing } = await client
+    .from("organizations_addresses")
+    .select()
+    .eq("address", organization_address)
+    .eq("service", "whatsapp")
+    .eq("status", "connected")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle()
+    .throwOnError();
+
+  if (existing) return existing;
+
+  log.info("Bridge: creating organization for new session", {
+    organization_address,
+  });
+
+  const { data: org, error: orgError } = await client
+    .from("organizations")
+    .insert({ name: `WhatsApp ${organization_address}` })
+    .select()
+    .single();
+
+  if (orgError) throw orgError;
+
+  const { data: address, error: addrError } = await client
+    .from("organizations_addresses")
+    .insert({
+      organization_id: org.id,
+      address: organization_address,
+      service: "whatsapp",
+      status: "connected",
+    })
+    .select()
+    .single();
+
+  if (addrError) throw addrError;
+
+  return address as OrganizationAddressRow;
+}
+
+/**
+ * Finds the conversation for a bridge chat address, creating it on first
+ * contact. Groups get their subject stored as name when provided.
+ */
+async function ensureBridgeConversation(
+  client: SupabaseClient<Database>,
+  organization_id: string,
+  organization_address: string,
+  conversation_address: string,
+  conversation_name?: string,
+): Promise<string> {
+  const { data: existing } = await client
+    .from("conversations")
+    .select("id")
+    .eq("organization_id", organization_id)
+    .eq("organization_address", organization_address)
+    .eq("address", conversation_address)
+    .eq("service", "whatsapp")
+    .maybeSingle()
+    .throwOnError();
+
+  if (existing) {
+    // Backfill the group subject when the bridge names a chat we already have.
+    if (conversation_name) {
+      await client
+        .from("conversations")
+        .update({ name: conversation_name })
+        .eq("id", existing.id)
+        .throwOnError();
+    }
+    return existing.id;
+  }
+
+  const isGroup = conversation_address.endsWith("@g.us");
+
+  const { data: created, error } = await client
+    .from("conversations")
+    .insert({
+      organization_id,
+      organization_address,
+      address: conversation_address,
+      service: "whatsapp",
+      type: isGroup ? "group" : "direct",
+      ...(conversation_name && { name: conversation_name }),
+    })
+    .select("id")
+    .single();
+
+  if (error) throw error;
+
+  log.info("Bridge: created conversation", {
+    organization_id,
+    conversation_address,
+    type: isGroup ? "group" : "direct",
+  });
+
+  return created.id;
+}
+
+/**
+ * Processes a webhook batch from the whatsmeow bridge (Bearer token auth).
+ * Persists messages, statuses, contacts, groups, edits and revokes following
+ * the same upsert/merge semantics as the Meta flow.
+ */
+async function processBridgeBatch(request: Request): Promise<Response> {
+  const client = createUnsecureClient();
+
+  let batch: BridgeWebhookBatch;
+  try {
+    batch = (await request.json()) as BridgeWebhookBatch;
+  } catch {
+    return new Response("Invalid JSON body", { status: 400 });
+  }
+
+  if (!batch.organization_address) {
+    return new Response("Missing organization_address", { status: 400 });
+  }
+
+  const orgAddressRow = await ensureBridgeOrganization(
+    client,
+    batch.organization_address,
+  );
+  const organization_id = orgAddressRow.organization_id;
+  const organization_address = orgAddressRow.address;
+
+  log.info("Bridge webhook batch", {
+    organization_id,
+    organization_address,
+    history: batch.history ?? false,
+    messages: batch.messages?.length ?? 0,
+    statuses: batch.statuses?.length ?? 0,
+    contacts: batch.contacts?.length ?? 0,
+    groups: batch.groups?.length ?? 0,
+    edits: batch.edits?.length ?? 0,
+    revokes: batch.revokes?.length ?? 0,
+  });
+
+  // Contacts: upsert address-book rows (pushname courtesy from the bridge).
+  if (batch.contacts?.length) {
+    const rows = batch.contacts.map((c) => ({
+      organization_id,
+      organization_address,
+      address: c.address,
+      service: "whatsapp" as const,
+      extra: {
+        name: (c.extra as { name?: string } | undefined)?.name,
+        ...(c.extra ?? {}),
+      },
+    }));
+
+    const deduped = Array.from(
+      new Map(
+        rows.map((r) => [
+          `${r.organization_id}|${r.organization_address}|${r.address}|${r.service}`,
+          r,
+        ]),
+      ).values(),
+    );
+
+    const { error } = await client.from("contacts_addresses").upsert(deduped);
+    if (error) {
+      log.error("Bridge: failed to upsert contacts_addresses", { error });
+      throw error;
+    }
+  }
+
+  // Groups: ensure conversations exist with their subject as name.
+  if (batch.groups?.length) {
+    for (const g of batch.groups) {
+      await ensureBridgeConversation(
+        client,
+        organization_id,
+        organization_address,
+        g.address,
+        g.name,
+      );
+    }
+  }
+
+  // Messages: upsert keyed by external_id. The bridge content is already in
+  // OpenBSP's MessageContent shape, so it passes through verbatim. History
+  // batches describe already-happened messages: disarm the dispatcher wake
+  // (pending: null) the same way the Meta history flow does.
+  const messages: MessageInsert[] = [];
+  if (batch.messages?.length) {
+    for (const m of batch.messages) {
+      const conversation_id = await ensureBridgeConversation(
+        client,
+        organization_id,
+        organization_address,
+        m.conversation_address,
+        m.conversation_name,
+      );
+
+      messages.push({
+        organization_id,
+        external_id: m.external_id,
+        service: "whatsapp",
+        organization_address,
+        conversation_id,
+        conversation_address: m.conversation_address,
+        // Empty sender = the account itself spoke (echo); leave it null so
+        // downstream can tell echoes apart from inbound.
+        ...(m.sender_address && { sender_address: m.sender_address }),
+        content: m.content as unknown as MessageInsert["content"],
+        ...(batch.history && { status: { pending: null } }),
+        timestamp: m.timestamp,
+      });
+    }
+  }
+
+  // Statuses: upsert rows that only merge `status` (content `{}` merges
+  // innocuously per the merge trigger, same as the Meta flow).
+  const statuses: MessageInsert[] = [];
+  if (batch.statuses?.length) {
+    for (const s of batch.statuses) {
+      const conversation_id = await ensureBridgeConversation(
+        client,
+        organization_id,
+        organization_address,
+        s.conversation_address,
+      );
+
+      statuses.push({
+        organization_id,
+        external_id: s.external_id,
+        service: "whatsapp",
+        organization_address,
+        conversation_id,
+        conversation_address: s.conversation_address,
+        content: {} as OutgoingMessage, // this will get merged (it won't overwrite)
+        status: s.status as MessageInsert["status"],
+      });
+    }
+  }
+
+  const upsertBatch = async (label: string, rows: MessageInsert[]) => {
+    if (rows.length === 0) return;
+    const { error } = await client
+      .from("messages")
+      .upsert(rows, { onConflict: "external_id" });
+    if (error) {
+      log.error(`Bridge: failed to upsert ${label}`, {
+        error,
+        count: rows.length,
+      });
+      throw error;
+    }
+    log.info(`Bridge: persisted ${label}`, { count: rows.length });
+  };
+
+  await upsertBatch("statuses", statuses);
+  await upsertBatch("messages", messages);
+
+  // Edits: replace the text of the original row in place.
+  for (const e of batch.edits ?? []) {
+    await client
+      .from("messages")
+      .update({
+        content: { text: e.text },
+        status: { edited: e.timestamp },
+      })
+      .eq("external_id", e.original_message_id)
+      .throwOnError();
+  }
+
+  // Revokes: merge a `deleted` status onto the original row.
+  for (const r of batch.revokes ?? []) {
+    await client
+      .from("messages")
+      .update({ status: { deleted: r.timestamp } })
+      .eq("external_id", r.original_message_id)
+      .throwOnError();
+  }
+
+  log.info("Bridge webhook batch done", {
+    organization_id,
+    messages: messages.length,
+    statuses: statuses.length,
+    edits: batch.edits?.length ?? 0,
+    revokes: batch.revokes?.length ?? 0,
+  });
+
+  return new Response();
+}
+
 async function processMessage(request: Request): Promise<Response> {
+  // Bridge (whatsmeow) path: Bearer token auth, OpenBSP-native payload.
+  // Checked before the Meta signature flow so the two can coexist.
+  const authHeader = request.headers.get("Authorization");
+  if (
+    BRIDGE_TOKEN && authHeader === `Bearer ${BRIDGE_TOKEN}`
+  ) {
+    return await processBridgeBatch(request);
+  }
+
   const body = await request.text();
 
   // Validate that the request comes from Meta
