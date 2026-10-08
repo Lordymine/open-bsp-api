@@ -807,7 +807,7 @@ async function processBridgeBatch(request: Request): Promise<Response> {
         // downstream can tell echoes apart from inbound.
         ...(m.sender_address && { sender_address: m.sender_address }),
         content: m.content as unknown as MessageInsert["content"],
-        ...(batch.history && { status: { pending: null } }),
+        status: batch.history ? { pending: null } : {},
         timestamp: m.timestamp,
       });
     }
